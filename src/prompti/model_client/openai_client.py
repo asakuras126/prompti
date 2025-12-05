@@ -3,11 +3,75 @@
 from typing import AsyncGenerator, Generator, Union, Dict, Any
 import json
 import httpx
+import time
 
 from ..message import Message, ModelResponse, StreamingModelResponse, Choice, StreamingChoice, Usage
-from .base import ModelClient, SyncModelClient, RunParams
+from .base import ModelClient, SyncModelClient, RunParams, should_retry_error, calculate_retry_delay, handle_model_client_error, is_context_length_error
+from .image_utils import convert_image_urls_to_base64, preserve_original_image_urls
+from ..logger import get_logger
 
+logger = get_logger(__name__)
 
+def filter_empty_text_content(content):
+    """Filter out empty text items from message content."""
+    if isinstance(content, str):
+        return content
+    
+    if not isinstance(content, list):
+        return content
+    
+    filtered_content = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "text":
+            # 如果是text类型且text为空字符串，跳过这个item
+            if item.get("text", "").strip():
+                filtered_content.append(item)
+        else:
+            filtered_content.append(item)
+    
+    return filtered_content
+
+def is_blank_user_message_text_item(msg: Message):
+    """判断message是否为空的user消息。
+    
+    Args:
+        msg: Message对象
+        
+    Returns:
+        bool: 如果是user类型且内容为空则返回True，否则返回False
+    """
+    if msg.role != "user":
+        return False
+    
+    if msg.content is None:
+        return True
+    
+    # 如果content是字符串类型
+    if isinstance(msg.content, str):
+        return not msg.content
+    
+    # 如果content是列表类型
+    if isinstance(msg.content, list):
+        if len(msg.content) == 0:
+            return True
+        
+        # 检查列表中所有item是否都为空
+        for item in msg.content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                # 如果有任何一个text不为空，则消息不为空
+                if item.get("text", ""):
+                    return False
+            else:
+                # 如果有非text类型的item（如image_url），则消息不为空
+                return False
+        
+        # 所有text类型的item都为空，消息为空
+        return True
+    
+    # 其他类型的content视为非空
+    return False
+
+        
 class OpenAIClient(ModelClient):
     """OpenAI-compatible API client."""
 
@@ -19,69 +83,65 @@ class OpenAIClient(ModelClient):
         request_data = self._build_request_data(params)
         url = self.cfg.api_url or "https://api.openai.com/v1/chat/completions"
         headers = self._build_headers()
-        self._logger.info(request_data)
-        try:
-            if params.stream:
-                # 处理流式响应 - 使用 client.stream()
-                async with self._client.stream(
-                    "POST",
-                    url,
-                    headers=headers,
-                    json=request_data,
-                ) as response:
-                    response.raise_for_status()
-                    async for message in self._aprocess_streaming_response(response):
-                        yield message
-            else:
-                # 处理非流式响应 - 使用普通 post
-                response = await self._client.post(
-                    url=url,
-                    headers=headers,
-                    json=request_data,
-                )
-                response.raise_for_status()
-                yield self._process_non_streaming_response(response)
+        self._logger.debug(request_data)
 
-        except httpx.HTTPStatusError as e:
-            # HTTP错误（4xx, 5xx）
-            error_detail = "Unknown error"
+        # 设置超时时间
+        timeout = params.timeout if params.timeout is not None else 600
+        
+        # 手动重试逻辑
+        max_retries = 2
+        for attempt in range(max_retries):
             try:
-                if e.response.content:
-                    error_data = e.response.json()
-                    if "error" in error_data:
-                        error_detail = error_data["error"].get("message", str(error_data["error"]))
-                    else:
-                        error_detail = str(error_data)
+                logger.debug(f"Attempt {attempt + 1}/{max_retries}")
+
+                if params.stream:
+                    # 处理流式响应 - 使用 client.stream()
+                    async with self._client.stream(
+                        "POST",
+                        url,
+                        headers=headers,
+                        json=request_data,
+                        timeout=timeout,
+                    ) as response:
+                        response.raise_for_status()
+                        async for message in self._aprocess_streaming_response(response):
+                            yield message
+                        return
                 else:
-                    error_detail = f"HTTP {e.response.status_code}"
-            except Exception:
-                error_detail = f"HTTP {e.response.status_code}: {e.response.text}"
+                    # 处理非流式响应 - 使用普通 post
+                    response = await self._client.post(
+                        url=url,
+                        headers=headers,
+                        json=request_data,
+                        timeout=timeout,
+                    )
+                    response.raise_for_status()
+                    yield self._process_non_streaming_response(response)
+                    return  # 成功则退出重试循环
 
-            self._logger.error(f"OpenAI API HTTP error: {error_detail}")
-            # 返回相应的错误响应
-            yield self._create_error_response(error_detail, is_streaming=params.stream)
+            except Exception as e:
+                is_last_attempt = attempt == max_retries - 1
+                should_retry = should_retry_error(e)
 
-        except httpx.RequestError as e:
-            # 网络连接错误
-            error_msg = f"Network error: {str(e)}"
-            import traceback
-            traceback.print_exc()
-            self._logger.error(error_msg)
-            # 返回相应的错误响应
-            yield self._create_error_response(error_msg, is_streaming=params.stream)
+                if should_retry and not is_last_attempt:
+                    # 计算等待时间（指数退避，基于错误类型调整）
+                    wait_time = calculate_retry_delay(attempt, error=e)
+                    logger.warning(f"Request failed (attempt {attempt + 1}), retrying in {wait_time}s: {str(e)}")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    # 最后一次尝试失败或不应该重试的错误
+                    logger.error(f"Request failed permanently: {str(e)}")
+                    # 处理错误并返回错误响应
+                    yield handle_model_client_error(e, params.stream, self._create_error_response)
+                    return
 
-        except Exception as e:
-            # 其他错误
-            error_msg = f"Unexpected error: {str(e)}"
-            self._logger.error(error_msg)
-            # 返回相应的错误响应
-            yield self._create_error_response(error_msg, is_streaming=params.stream)
-            import traceback
-            traceback.print_exc()
 
-    def _create_error_response(self, error_message: str, is_streaming: bool = False) -> Union[
+    def _create_error_response(self, error_message: str, is_streaming: bool = False,
+                              error_type: str = None, error_code: str = None) -> Union[
         ModelResponse, StreamingModelResponse]:
         """创建错误响应"""
+        
         # 尝试解析OpenAI标准错误格式
         error_object = None
         try:
@@ -90,27 +150,55 @@ class OpenAIClient(ModelClient):
                 parsed_error = json.loads(error_message)
                 if "error" in parsed_error:
                     error_object = parsed_error["error"]
+                    # 检查是否为上下文长度错误
+                    if is_context_length_error(error_object.get("message", "")):
+                        error_object["type"] = "context_length_exceed_error"
+                        error_object["code"] = "context_length_exceed"
+                else:
+                    # 检查是否为上下文长度错误
+                    if is_context_length_error(error_message):
+                        error_object = {
+                            "message": error_message,
+                            "type": "context_length_exceed_error",
+                            "code": "context_length_exceed"
+                        }
+                    else:
+                        # 包装成标准格式
+                        error_object = {
+                            "message": error_message,
+                            "type": error_type or "api_error",
+                            "code": error_code or "unknown_error"
+                        }
+            else:
+                # 检查是否为上下文长度错误
+                if is_context_length_error(error_message):
+                    error_object = {
+                        "message": error_message,
+                        "type": "context_length_exceed_error",
+                        "code": "context_length_exceed"
+                    }
                 else:
                     # 包装成标准格式
                     error_object = {
                         "message": error_message,
-                        "type": "api_error",
-                        "code": "unknown_error"
+                        "type": error_type or "api_error",
+                        "code": error_code or "unknown_error"
                     }
-            else:
-                # 包装成标准格式
+        except json.JSONDecodeError:
+            # 检查是否为上下文长度错误
+            if is_context_length_error(error_message):
                 error_object = {
                     "message": error_message,
-                    "type": "api_error",
-                    "code": "unknown_error"
+                    "type": "context_length_exceed_error",
+                    "code": "context_length_exceed"
                 }
-        except json.JSONDecodeError:
-            # 如果不是JSON，包装成标准格式
-            error_object = {
-                "message": error_message,
-                "type": "api_error",
-                "code": "unknown_error"
-            }
+            else:
+                # 如果不是JSON，包装成标准格式
+                error_object = {
+                    "message": error_message,
+                    "type": error_type or "api_error",
+                    "code": error_code or "unknown_error"
+                }
 
         # 根据请求类型创建相应的错误响应
         if is_streaming:
@@ -133,10 +221,19 @@ class OpenAIClient(ModelClient):
         """构建OpenAI API请求数据。"""
         # 转换消息格式
         messages = []
+        
         for msg in params.messages:
+            if is_blank_user_message_text_item(msg):
+                continue
+            converted_content = convert_image_urls_to_base64(msg.content) if msg.content else msg.content
+            
+            # 如果转换后的内容是空列表，跳过这个消息
+            if isinstance(converted_content, list) and len(converted_content) == 0:
+                continue
+            
             openai_msg = {
                 "role": msg.role,
-                "content": msg.content
+                "content": converted_content
             }
 
             # 添加工具调用字段
@@ -162,7 +259,7 @@ class OpenAIClient(ModelClient):
                 item["content"] = flatt_content
         # 基础请求数据
         request_data = {
-            "model": self.cfg.model,
+            "model": self.cfg.get_actual_model_name(),  # 使用真实模型名称进行API调用
             "messages": messages,
             "stream": params.stream,
         }
@@ -178,18 +275,22 @@ class OpenAIClient(ModelClient):
         elif self.cfg.temperature is not None:
             request_data["temperature"] = self.cfg.temperature
 
-        if params.top_p is not None:
-            request_data["top_p"] = params.top_p
-        elif self.cfg.top_p is not None:
-            request_data["top_p"] = self.cfg.top_p
+        # 对于名称中包含claude-sonnet-4-5、claude-haiku-4-5-20251001、gpt-5、gpt-5-pro的模型，不设置top_p参数
+        model_name = self.cfg.get_actual_model_name()
+        if not any(model in model_name for model in ["claude-sonnet-4-5", "claude-haiku-4-5-20251001", 
+                                                     "gpt-5", "gpt-5-pro"]):
+            if params.top_p is not None:
+                request_data["top_p"] = params.top_p
+            elif self.cfg.top_p is not None:
+                request_data["top_p"] = self.cfg.top_p
 
         if params.max_tokens is not None:
-            if request_data.get("model", "") in ["o4-mini", "gpt-5", "gpt-5-mini", "gpt-5-nano"]:
+            if self.cfg.get_actual_model_name() in ["o4-mini", "gpt-5", "gpt-5-mini", "gpt-5-nano"]:
                 request_data["max_completion_tokens"] = params.max_tokens
             else:
                 request_data["max_tokens"] = params.max_tokens
         elif self.cfg.max_tokens is not None:
-            if request_data.get("model", "") in ["o4-mini", "gpt-5", "gpt-5-mini", "gpt-5-nano"]:
+            if self.cfg.get_actual_model_name() in ["o4-mini", "gpt-5", "gpt-5-mini", "gpt-5-nano"]:
                 request_data["max_completion_tokens"] = self.cfg.max_tokens
             else:
                 request_data["max_tokens"] = self.cfg.max_tokens
@@ -218,9 +319,13 @@ class OpenAIClient(ModelClient):
 
         # 添加额外参数
         request_data.update(params.extra_params)
-        if self.cfg.model in ["o4-mini", "gpt-5", "gpt-5-mini", "gpt-5-nano"]:
+        if self.cfg.get_actual_model_name() in ["o4-mini", "gpt-5", "gpt-5-mini", "gpt-5-nano"]:
             request_data.pop("top_p", None)
-        params.trace_context["llm_request"] = request_data
+        
+        # 为数据上报保留原始URL格式
+        original_request_data = request_data.copy()
+        params.trace_context["llm_request_body"] = original_request_data
+        
         return request_data
 
     def _add_tool_params(self, request_data: Dict[str, Any], tool_params) -> None:
@@ -324,7 +429,7 @@ class OpenAIClient(ModelClient):
                                 id=data.get("id", ""),
                                 object=data.get("object", "chat.completion.chunk"),
                                 created=data.get("created", 0),
-                                model=data.get("model", self.cfg.model),
+                                model=data.get("model", self.cfg.get_aggregated_model_name()),
                                 choices=[streaming_choice],
                                 system_fingerprint=data.get("system_fingerprint"),
                                 usage=usage
@@ -373,7 +478,7 @@ class OpenAIClient(ModelClient):
                 id=data.get("id", ""),
                 object=data.get("object", "chat.completion"),
                 created=data.get("created", 0),
-                model=data.get("model", self.cfg.model),
+                model=data.get("model", self.cfg.get_aggregated_model_name()),
                 choices=[choice],
                 usage=usage,
                 system_fingerprint=data.get("system_fingerprint")
@@ -389,88 +494,122 @@ class SyncOpenAIClient(SyncModelClient):
 
     def _run(self, params: RunParams) -> Generator[Union[ModelResponse, StreamingModelResponse], None, None]:
         """Execute the OpenAI API call."""
+        # 构建请求数据
         request_data = self._build_request_data(params)
         url = self.cfg.api_url or "https://api.openai.com/v1/chat/completions"
         headers = self._build_headers()
-        self._logger.info(request_data)
-        try:
-            if params.stream:
-                with self._client.stream(
-                    "POST",
-                    url,
-                    headers=headers,
-                    json=request_data,
-                ) as response:
-                    response.raise_for_status()
-                    for message in self._process_streaming_response(response):
-                        yield message
-            else:
-                response = self._client.post(
-                    url=url,
-                    headers=headers,
-                    json=request_data,
-                )
-                response.raise_for_status()
-                yield self._process_non_streaming_response(response)
-
-        except httpx.HTTPStatusError as e:
-            error_detail = "Unknown error"
+        logger.debug(f"Request data: {request_data}, headers: {headers}, url: {url}")
+        # 设置超时时间
+        timeout = params.timeout if params.timeout is not None else 600
+        
+        # 手动重试逻辑
+        max_retries = 2
+        for attempt in range(max_retries):
             try:
-                if e.response.content:
-                    error_data = e.response.json()
-                    if "error" in error_data:
-                        error_detail = error_data["error"].get("message", str(error_data["error"]))
-                    else:
-                        error_detail = str(error_data)
+                logger.debug(f"Attempt {attempt + 1}/{max_retries}")
+                
+                if params.stream:
+                    # 处理流式响应
+                    with self._client.stream(
+                        "POST",
+                        url,
+                        headers=headers,
+                        json=request_data,
+                        timeout=timeout,
+                    ) as response:
+                        response.raise_for_status()
+                        for message in self._process_streaming_response(response):
+                            yield message
+                        return
                 else:
-                    error_detail = f"HTTP {e.response.status_code}"
-            except Exception:
-                error_detail = f"HTTP {e.response.status_code}: {e.response.text}"
+                    # 处理非流式响应
+                    response = self._client.post(
+                        url=url,
+                        headers=headers,
+                        json=request_data,
+                        timeout=timeout,
+                    )
 
-            self._logger.error(f"OpenAI API HTTP error: {error_detail}")
-            yield self._create_error_response(error_detail, is_streaming=params.stream)
+                    response.raise_for_status()
+                    yield self._process_non_streaming_response(response)
+                    return  # 成功则退出重试循环
+                    
+            except Exception as e:
+                is_last_attempt = attempt == max_retries - 1
+                should_retry = should_retry_error(e)
+                
+                if should_retry and not is_last_attempt:
+                    # 计算等待时间（指数退避，基于错误类型调整）
+                    wait_time = calculate_retry_delay(attempt, error=e)
+                    logger.warning(f"Request failed (attempt {attempt + 1}), retrying in {wait_time}s: {str(e)}")
+                    
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # 最后一次尝试失败或不应该重试的错误
+                    logger.error(f"Request failed permanently: {str(e)}")
+                    # 处理错误并返回错误响应
+                    yield handle_model_client_error(e, params.stream, self._create_error_response)
+                    return
 
-        except httpx.RequestError as e:
-            error_msg = f"Network error: {str(e)}"
-            import traceback
-            traceback.print_exc()
-            self._logger.error(error_msg)
-            yield self._create_error_response(error_msg, is_streaming=params.stream)
-
-        except Exception as e:
-            error_msg = f"Unexpected error: {str(e)}"
-            self._logger.error(error_msg)
-            yield self._create_error_response(error_msg, is_streaming=params.stream)
-            import traceback
-            traceback.print_exc()
-
-    def _create_error_response(self, error_message: str, is_streaming: bool = False) -> Union[
+    def _create_error_response(self, error_message: str, is_streaming: bool = False,
+                              error_type: str = None, error_code: str = None) -> Union[
         ModelResponse, StreamingModelResponse]:
         """创建错误响应"""
+        # 检测上下文长度超限错误（使用base.py中的共用函数）
+        
         error_object = None
         try:
             if error_message.strip().startswith('{'):
                 parsed_error = json.loads(error_message)
                 if "error" in parsed_error:
                     error_object = parsed_error["error"]
+                    # 检查是否为上下文长度错误
+                    if is_context_length_error(error_object.get("message", "")):
+                        error_object["type"] = "context_length_exceed_error"
+                        error_object["code"] = "context_length_exceed"
+                else:
+                    # 检查是否为上下文长度错误
+                    if is_context_length_error(error_message):
+                        error_object = {
+                            "message": error_message,
+                            "type": "context_length_exceed_error",
+                            "code": "context_length_exceed"
+                        }
+                    else:
+                        error_object = {
+                            "message": error_message,
+                            "type": error_type or "api_error",
+                            "code": error_code or "unknown_error"
+                        }
+            else:
+                # 检查是否为上下文长度错误
+                if is_context_length_error(error_message):
+                    error_object = {
+                        "message": error_message,
+                        "type": "context_length_exceed_error",
+                        "code": "context_length_exceed"
+                    }
                 else:
                     error_object = {
                         "message": error_message,
-                        "type": "api_error",
-                        "code": "unknown_error"
+                        "type": error_type or "api_error",
+                        "code": error_code or "unknown_error"
                     }
+        except json.JSONDecodeError:
+            # 检查是否为上下文长度错误
+            if is_context_length_error(error_message):
+                error_object = {
+                    "message": error_message,
+                    "type": "context_length_exceed_error",
+                    "code": "context_length_exceed"
+                }
             else:
                 error_object = {
                     "message": error_message,
-                    "type": "api_error",
-                    "code": "unknown_error"
+                    "type": error_type or "api_error",
+                    "code": error_code or "unknown_error"
                 }
-        except json.JSONDecodeError:
-            error_object = {
-                "message": error_message,
-                "type": "api_error",
-                "code": "unknown_error"
-            }
 
         if is_streaming:
             return StreamingModelResponse(error=error_object)
@@ -491,10 +630,16 @@ class SyncOpenAIClient(SyncModelClient):
     def _build_request_data(self, params: RunParams) -> Dict[str, Any]:
         """构建OpenAI API请求数据。"""
         messages = []
+        
         for msg in params.messages:
+            # 先过滤空text，再转换图片URL为base64
+            if is_blank_user_message_text_item(msg):
+                continue
+            converted_content = convert_image_urls_to_base64(msg.content) if msg.content else msg.content
+            
             openai_msg = {
                 "role": msg.role,
-                "content": msg.content
+                "content": converted_content
             }
 
             if msg.tool_calls:
@@ -518,7 +663,7 @@ class SyncOpenAIClient(SyncModelClient):
                 item["content"] = flatt_content
 
         request_data = {
-            "model": self.cfg.model,
+            "model": self.cfg.get_actual_model_name(),  # 使用真实模型名称进行API调用
             "messages": messages,
             "stream": params.stream,
         }
@@ -533,18 +678,22 @@ class SyncOpenAIClient(SyncModelClient):
         elif self.cfg.temperature is not None:
             request_data["temperature"] = self.cfg.temperature
 
-        if params.top_p is not None:
-            request_data["top_p"] = params.top_p
-        elif self.cfg.top_p is not None:
-            request_data["top_p"] = self.cfg.top_p
+        # 对于名称中包含claude-sonnet-4-5、claude-haiku-4-5-20251001、gpt-5、gpt-5-pro的模型，不设置top_p参数
+        model_name = self.cfg.get_actual_model_name()
+        if not any(model in model_name for model in ["claude-sonnet-4-5", "claude-haiku-4-5-20251001", 
+                                                     "gpt-5", "gpt-5-pro"]):
+            if params.top_p is not None:
+                request_data["top_p"] = params.top_p
+            elif self.cfg.top_p is not None:
+                request_data["top_p"] = self.cfg.top_p
 
         if params.max_tokens is not None:
-            if request_data.get("model", "") in ["o4-mini", "gpt-5", "gpt-5-mini", "gpt-5-nano"]:
+            if self.cfg.get_actual_model_name() in ["o4-mini", "gpt-5", "gpt-5-mini", "gpt-5-nano"]:
                 request_data["max_completion_tokens"] = params.max_tokens
             else:
                 request_data["max_tokens"] = params.max_tokens
         elif self.cfg.max_tokens is not None:
-            if request_data.get("model", "") in ["o4-mini", "gpt-5", "gpt-5-mini", "gpt-5-nano"]:
+            if self.cfg.get_actual_model_name() in ["o4-mini", "gpt-5", "gpt-5-mini", "gpt-5-nano"]:
                 request_data["max_completion_tokens"] = self.cfg.max_tokens
             else:
                 request_data["max_tokens"] = self.cfg.max_tokens
@@ -571,9 +720,12 @@ class SyncOpenAIClient(SyncModelClient):
             self._add_tool_params(request_data, params.tool_params)
 
         request_data.update(params.extra_params)
-        if self.cfg.model in ["o4-mini", "gpt-5", "gpt-5-mini", "gpt-5-nano"]:
+        if self.cfg.get_actual_model_name() in ["o4-mini", "gpt-5", "gpt-5-mini", "gpt-5-nano"]:
             request_data.pop("top_p", None)
-        params.trace_context["llm_request"] = request_data
+        
+        # 为数据上报保留原始URL格式
+        original_request_data = request_data.copy()
+        params.trace_context["llm_request_body"] = original_request_data
         return request_data
 
     def _add_tool_params(self, request_data: Dict[str, Any], tool_params) -> None:
@@ -668,7 +820,7 @@ class SyncOpenAIClient(SyncModelClient):
                                 id=data.get("id", ""),
                                 object=data.get("object", "chat.completion.chunk"),
                                 created=data.get("created", 0),
-                                model=data.get("model", self.cfg.model),
+                                model=data.get("model", self.cfg.get_aggregated_model_name()),
                                 choices=[streaming_choice],
                                 system_fingerprint=data.get("system_fingerprint"),
                                 usage=usage
@@ -713,7 +865,7 @@ class SyncOpenAIClient(SyncModelClient):
                 id=data.get("id", ""),
                 object=data.get("object", "chat.completion"),
                 created=data.get("created", 0),
-                model=data.get("model", self.cfg.model),
+                model=data.get("model", self.cfg.get_aggregated_model_name()),
                 choices=[choice],
                 usage=usage,
                 system_fingerprint=data.get("system_fingerprint")

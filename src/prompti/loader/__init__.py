@@ -1,18 +1,42 @@
-"""Template loaders package."""
+"""Loaders for serving templates and model configurations from different sources."""
 
 from __future__ import annotations
 
-from .base import TemplateLoader, TemplateNotFoundError
-from .file import FileSystemLoader
-from .http import HTTPLoader
-from .local_git_repo import LocalGitRepoLoader
-from .memory import MemoryLoader
+# Template loaders
+from .template_loader import (
+    TemplateLoader,
+    TemplateNotFoundError, 
+    VersionEntry,
+    MemoryLoader,
+    FileLoader,
+    FileSystemLoader,  # Backward compatibility
+    HTTPLoader,
+    LocalGitRepoLoader,
+)
+
+# Model config loaders  
+from .model_config_loader import (
+    ModelConfigLoader,
+    ModelConfigNotFoundError,
+    FileModelConfigLoader,
+    HTTPModelConfigLoader,
+    MemoryModelConfigLoader,
+)
 
 __all__ = [
+    # Template loaders
     "TemplateLoader",
     "TemplateNotFoundError",
-    "FileSystemLoader",
+    "VersionEntry", 
     "MemoryLoader",
+    "FileLoader",
+    "FileSystemLoader",  # Backward compatibility
     "HTTPLoader",
     "LocalGitRepoLoader",
+    # Model config loaders
+    "ModelConfigLoader",
+    "ModelConfigNotFoundError",
+    "FileModelConfigLoader",
+    "HTTPModelConfigLoader", 
+    "MemoryModelConfigLoader",
 ]

@@ -1,0 +1,21 @@
+name: summary
+description: Text summary
+version: "1.0"
+aliases: ["prod", "latest"]
+variants:
+  default:
+    selector: []
+    required_variables: ["summary"]
+    model_cfg:
+      provider: litellm
+      model: gpt-3.5-turbo
+    messages:
+      - role: system
+        content:
+          - type: text
+            text: |
+              Please summarize the following text.
+      - role: assistant
+        content:
+          - type: text
+            text: "{{ summary }}"

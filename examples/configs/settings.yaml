@@ -1,0 +1,21 @@
+# PromptI Engine Settings
+# This file configures the PromptI engine behavior
+
+# Template paths (list of directories where templates are stored)
+# optional
+template_paths:
+  - "examples/configs/prompts"
+
+# optional
+#model_config_path: "examples/configs/models.yaml"
+
+# Cache time-to-live in seconds
+cache_ttl: 300
+
+# Model configuration refresh interval in seconds (default: 300 = 5 minutes)
+model_config_refresh_interval: 300
+
+# Registry URL for fetching templates (optional)
+registry_url: "http://10.224.55.241/api/v1"
+#registry_url: "http://localhost:8080/api/v1"
+registry_api_key: "28335975-fc47-4fdf-80d6-a957af25f7a2"

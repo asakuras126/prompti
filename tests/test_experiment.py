@@ -24,7 +24,7 @@ async def test_unleash_registry():
     mock_client.get.return_value = mock_response
 
     reg = UnleashRegistry("http://unleash", client=mock_client)
-    split = await reg.get_split("clarify", "u1")
+    split = await reg.aget_split("clarify", "u1")
     assert split.experiment_id == "clarify"
     assert split.variant == "A"
 
@@ -36,7 +36,7 @@ async def test_unleash_registry():
 async def test_growthbook_registry():
     features = {"clarify": {"id": "clarify", "variants": {"A": 0.5, "B": 0.5}}}
     reg = GrowthBookRegistry(features)
-    split = await reg.get_split("clarify", "user1")
+    split = await reg.aget_split("clarify", "user1")
     assert split.traffic_split == {"A": 0.5, "B": 0.5}
     assert split.variant is None
 

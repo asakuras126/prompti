@@ -1,0 +1,21 @@
+models:
+  - model: gpt-3.5-turbo
+    provider: openai
+    api_key: sk-proj-3qH7t****
+    api_url: https://api.openai.com/v1/chat/completions
+  - model: gpt-4o
+    provider: openai
+    api_key: sk-proj-3qH7t****
+    api_url: https://api.openai.com/v1/chat/completions
+  - model: claude-sonnet-4-20250514
+    provider: openai
+    api_key: sk-aaoM7y5b82Rc****
+    api_url: https://aiproxy.usw.sealos.io/v1/chat/completions
+  - model: anthropic/claude-sonnet-4-20250514
+    provider: litellm
+    api_url: https://aiproxy.usw.sealos.io
+    api_key: sk-n2cV4S5ti02****
+  - model: gpt-4o
+    provider: litellm
+    api_url: https://api.openai.com/v1
+    api_key: sk-proj-3qH7tT****

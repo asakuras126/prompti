@@ -140,6 +140,11 @@ class Usage(BaseModel):
     prompt_tokens: int = Field(..., description="Number of tokens in the prompt")
     completion_tokens: int = Field(..., description="Number of tokens in the completion")
     total_tokens: int = Field(..., description="Total number of tokens used")
+    
+    # Cache-related fields for providers that support caching (e.g., Anthropic)
+    cache_creation_input_tokens: Optional[int] = Field(None, description="Number of tokens used to create cache")
+    cache_read_input_tokens: Optional[int] = Field(None, description="Number of tokens read from cache")
+    cached_tokens: Optional[int] = Field(None, description="Number of tokens that were cached")
 
 
 class Choice(BaseModel):

@@ -1,0 +1,23 @@
+name: multi_modal_analysis
+description: Analyse any image type
+version: "1.0"
+aliases: ["dev"]
+variants:
+  default:
+    selector: []
+    required_variables: ["image_url"]
+    model_cfg:
+      provider: litellm
+      model: gpt-4o
+    messages:
+      - role: system
+        content:
+          - type: text
+            text: You are an expert analyst capable of processing files.
+      - role: user
+        content:
+          - type: text
+            text: |
+              Please analyze this image.
+          - type: image_url
+            image_url: "{{ image_url }}"

@@ -28,7 +28,7 @@ async def test_span_has_request_attrs():
         user_id="u1",
     )
 
-    out = [m async for m in client.run(params)]
+    out = [m async for m in client.arun(params)]
     assert out[0].content == "ok"
 
     spans = exporter.get_finished_spans()

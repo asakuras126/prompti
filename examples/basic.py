@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+
 from prompti.engine import PromptEngine, Setting
+import logging
 from prompti.model_client.base import ModelConfig, RunParams, ToolParams, ToolSpec
-from prompti.message import Message
 
 logging.basicConfig(level=logging.INFO)
 
@@ -16,9 +16,9 @@ setting = Setting(
 )
 engine = PromptEngine.from_setting(setting)
 
+
 async def stream_call() -> None:
     """Render ``support_reply`` and print the response."""
-
     try:
         async for msg in engine.acompletion(
             "simple-demo",
@@ -58,7 +58,7 @@ async def multi_modal_call() -> None:
                 "instruction": "你是图像分析大师",
                 "query": "这张图片是什么？",
                 # 多张图片使用 "image_url": ["image1_url", "image2_url"]
-                "image_url": "https://agentos-promptstore.bj.bcebos.com/files/test/images/default/2989be85-9bfb-4e18-a339-48466320bf0f.jpg?authorization=bce-auth-v1%2FALTAKQ5esVBHZqtt4HtwEwoNQh%2F2025-07-22T07%3A35%3A56Z%2F604800%2F%2F5761014c2df87427a1ab41a1d054820ecbb2f5cd1516e998dd2430a75549764a&response-content-disposition=inline&response-content-type=image%2Fjpeg",
+                "image_url": "https://agentos-promptstore.bj.bcebos.com/files/test/images/default/2989be85-9bfb-4e18-a339-48466320bf0f.jpg?authorization=bce-auth-v1%2Fagentos%2F2025-07-22T07%3A35%3A56Z%2F604800%2F%2F5761014c2df87427a1ab41a1d054820ecbb2f5cd1516e998dd2430a75549764a&response-content-disposition=inline&response-content-type=image%2Fjpeg",
             },
             variant="multimodal",
             stream=False,
@@ -122,6 +122,7 @@ async def tool_call():
 def multi_chat() -> None:
     """Render ``support_reply`` and print the response."""
     try:
+        from prompti.message import Message
         messages = Message.get_openai_messages([
                 {
                     "role": "system",
@@ -195,8 +196,9 @@ def tool_call2() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(stream_call())
-    asyncio.run(tool_call())
-    asyncio.run(tool_call2())
-    asyncio.run(multi_modal_call())
+    # asyncio.run(stream_call())
+    # asyncio.run(tool_call())
+    # asyncio.run(tool_call2())
+
+    # asyncio.run(multi_modal_call())
     asyncio.run(multi_chat())

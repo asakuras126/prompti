@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .engine import PromptEngine
+from .engine import PromptEngine, BeforeRunHook, AfterRunHook, HookResult
 from .experiment import (
     ExperimentRegistry,
     ExperimentSplit,
@@ -47,6 +47,9 @@ __all__ = [
     "StreamingModelResponse",
     "PromptTemplate",
     "PromptEngine",
+    "BeforeRunHook",
+    "AfterRunHook", 
+    "HookResult",
     "ModelClient",
     "ModelConfig",
     "RunParams",

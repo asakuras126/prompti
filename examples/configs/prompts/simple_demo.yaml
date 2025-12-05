@@ -1,0 +1,21 @@
+name: simpel_demo
+description: simple demo for call prompti
+version: "1.0"
+aliases: ["dev"]
+variants:
+  default:
+    selector: []
+    required_variables: ["system_prompt", "user_query"]
+    model_cfg:
+      provider: openai
+      model: gpt-4o
+      temperature: 0.1
+      top_p: 0.1
+      max_tokens: 256
+    messages:
+      - role: system
+        content: "{{system_prompt}}"
+      - role: user
+        content:
+          - type: text
+            text: "{{user_query}}"

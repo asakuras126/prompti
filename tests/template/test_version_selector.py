@@ -1,8 +1,8 @@
 """Tests for version selector functionality in TemplateLoader."""
 import pytest
 
-from prompti.loader.base import TemplateLoader, TemplateNotFoundError, VersionEntry
-from prompti.loader.memory import MemoryLoader
+from prompti.loader.template_loader.base import TemplateLoader, TemplateNotFoundError, VersionEntry
+from prompti.loader.template_loader.memory import MemoryLoader
 
 
 class TestVersionEntry:
@@ -387,7 +387,7 @@ variants:
         }
         loader = MemoryLoader(mapping)
 
-        versions = await loader.list_versions("test_template")
+        versions = await loader.alist_versions("test_template")
         assert len(versions) == 1
         assert versions[0].id == "1.0.0"
         assert versions[0].aliases == ["prod", "stable"]
@@ -410,7 +410,7 @@ variants:
         }
         loader = MemoryLoader(mapping)
 
-        template = await loader.get_template("test_template", "1.0.0")
+        template = await loader.aget_template("test_template", "1.0.0")
         assert template.version == "1.0.0"
         assert template.aliases == ["prod"]
 
@@ -432,7 +432,7 @@ variants:
         loader = MemoryLoader(mapping)
 
         with pytest.raises(TemplateNotFoundError):
-            await loader.get_template("test_template", "2.0.0")
+            await loader.aget_template("test_template", "2.0.0")
 
     @pytest.mark.asyncio
     async def test_memory_loader_load_integration(self):
@@ -453,13 +453,13 @@ variants:
         loader = MemoryLoader(mapping)
 
         # Test loading with exact version
-        template = await loader.load("test_template", "1.0.0")
+        template = await loader.aload("test_template", "1.0.0")
         assert template.version == "1.0.0"
 
         # Test loading with aliases
-        template = await loader.load("test_template", "1.0.0#prod")
+        template = await loader.aload("test_template", "1.0.0#prod")
         assert template.version == "1.0.0"
 
         # Test loading with missing tag should fail
         with pytest.raises(ValueError):
-            await loader.load("test_template", "1.0.0#beta")
+            await loader.aload("test_template", "1.0.0#beta")

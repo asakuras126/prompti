@@ -70,7 +70,7 @@ class ModelClientRecorder(ModelClient):
             )
             step += 1
             try:
-                async for response in self._wrapped.run(params):
+                async for response in self._wrapped.arun(params):
                     # Determine direction based on response type
                     direction = "delta" if isinstance(response, StreamingModelResponse) else "res"
                     await self._write_row(f, step, direction, response.model_dump(), meta)
@@ -127,30 +127,40 @@ class ReplayEngine:
                     async for response in client.arun(params):
                         yield response
                 elif direction in ("delta", "res", "tool_result"):
-                    # For backward compatibility, convert stored message data to appropriate response type
+                    # Handle both new format (full response) and old format (just message) for backward compatibility
                     payload = row["payload"]
-                    if direction == "delta":
-                        # Create StreamingResponse from stored data
-                        yield StreamingModelResponse(
-                            id=payload.get("id", "replay"),
-                            model=model,
-                            choices=[{
-                                "index": 0,
-                                "delta": Message(**payload),
-                                "finish_reason": payload.get("finish_reason")
-                            }]
-                        )
+
+                    # Check if payload is already a complete response (new format)
+                    if "choices" in payload:
+                        # New format: payload is already a ModelResponse or StreamingModelResponse
+                        if direction == "delta":
+                            yield StreamingModelResponse(**payload)
+                        else:
+                            yield ModelResponse(**payload)
                     else:
-                        # Create ModelResponse from stored data
-                        yield ModelResponse(
-                            id=payload.get("id", "replay"),
-                            model=model,
-                            choices=[{
-                                "index": 0,
-                                "message": Message(**payload),
-                                "finish_reason": payload.get("finish_reason", "stop")
-                            }]
-                        )
+                        # Old format: payload is just a Message dict, reconstruct response
+                        if direction == "delta":
+                            # Create StreamingResponse from stored data
+                            yield StreamingModelResponse(
+                                id=payload.get("id", "replay"),
+                                model=model,
+                                choices=[{
+                                    "index": 0,
+                                    "delta": Message(**payload),
+                                    "finish_reason": payload.get("finish_reason")
+                                }]
+                            )
+                        else:
+                            # Create ModelResponse from stored data
+                            yield ModelResponse(
+                                id=payload.get("id", "replay"),
+                                model=model,
+                                choices=[{
+                                    "index": 0,
+                                    "message": Message(**payload),
+                                    "finish_reason": payload.get("finish_reason", "stop")
+                                }]
+                            )
                 elif direction == "error":
                     status = "fail"
                     raise ReplayError(row.get("payload"))

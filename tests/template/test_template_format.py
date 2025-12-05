@@ -9,11 +9,13 @@ from prompti.template import PromptTemplate, Variant
 
 @pytest.mark.asyncio
 async def test_load_from_file_has_expected_fields():
-    loader = FileSystemLoader(Path("tests/configs/prompts"))
-    versions = await loader.list_versions("summary")
+    # 使用相对于当前文件的路径
+    test_dir = Path(__file__).parent.parent / "configs" / "prompts"
+    loader = FileSystemLoader(test_dir)
+    versions = await loader.alist_versions("summary")
     assert len(versions) > 0
     version = versions[0].id
-    tmpl = await loader.get_template("summary", version)
+    tmpl = await loader.aget_template("summary", version)
     assert version == "1.0"
     assert tmpl.name == "summary"
     assert tmpl.version == "1.0"
@@ -133,7 +135,8 @@ def test_image_url_support():
     msgs, _ = template.format({"image_url": "https://example.com/image.jpg"}, variant="base")
     assert len(msgs) == 1
     assert msgs[0]["content"][0]["text"] == "Analyze this image:"
-    assert msgs[0]["content"][1]["image_url"] == "https://example.com/image.jpg"
+    # image_url is wrapped in a dict with 'url' key after formatting
+    assert msgs[0]["content"][1]["image_url"]["url"] == "https://example.com/image.jpg"
 
 
 def test_string_content_support():

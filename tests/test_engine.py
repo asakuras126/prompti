@@ -12,7 +12,7 @@ from prompti.loader import (
 )
 from prompti.message import Message, ModelResponse
 from prompti.model_client import ModelClient, ModelConfig, RunParams
-from prompti.model_client.config_loader import ModelConfigLoader
+from prompti.loader.model_config_loader import ModelConfigLoader
 from prompti.template import PromptTemplate, Variant
 
 
@@ -34,16 +34,16 @@ class DummyClient(ModelClient):
 class DummyConfigLoader(ModelConfigLoader):
     def __init__(self, cfg: ModelConfig) -> None:
         self.cfg = cfg
-        self.models = [cfg]
+        self.models = {cfg.model: [cfg]}
 
     def load(self):
         return self.cfg
-        
-    def get_model_config(self, model: str, provider: str=None) -> ModelConfig:
+
+    def get_model_config(self, model: str, provider: str=None, model_value: str=None, llm_token: str=None, model_control=None):
         if model == self.cfg.model:
-            return self.cfg
+            return [self.cfg]
         raise ValueError(f"Model {model} not found")
-        
+
     def list_models(self):
         return [self.cfg.model]
 
@@ -68,17 +68,17 @@ variants:
         # 创建一个返回 DummyClient 的模拟
         dummy_client = DummyClient(ModelConfig(provider="dummy", model="x"))
         mock_create_client.return_value = dummy_client
-        
+
         # 使用内存模板加载器创建引擎
         engine = PromptEngine([MemoryLoader({"x": {"yaml": yaml_text}})])
-        
-        # 运行模板
-        out = [m async for m in engine.run("x", {}, variant="base", stream=False)]
-        
+
+        # 运行模板 - 使用 acompletion 替代 run
+        out = [m async for m in engine.acompletion("x", {}, variant="base", stream=False)]
+
         # 验证结果
         assert isinstance(out[0], ModelResponse)
         assert out[0].choices[0].message.content == "ok"
-        
+
         # 验证创建客户端时使用了正确的配置
         mock_create_client.assert_called_once()
         cfg_arg = mock_create_client.call_args[0][0]
@@ -88,8 +88,10 @@ variants:
 
 @pytest.mark.asyncio
 async def test_load_returns_template():
-    engine = PromptEngine([FileSystemLoader(Path("tests/configs/prompts"))])
-    tmpl = await engine.load("summary")
+    # 使用相对于当前文件的路径
+    test_dir = Path(__file__).parent / "configs" / "prompts"
+    engine = PromptEngine([FileSystemLoader(test_dir)])
+    tmpl = await engine.aload("summary")
     assert isinstance(tmpl, PromptTemplate)
     assert tmpl.name == "summary"
     assert tmpl.version == "1.0"
@@ -97,16 +99,16 @@ async def test_load_returns_template():
 
 @pytest.mark.asyncio
 async def test_load_caches_result():
-    from prompti.loader.base import VersionEntry
+    from prompti.loader.template_loader.base import VersionEntry
 
     class CountingLoader(TemplateLoader):
         def __init__(self):
             self.calls = 0
 
-        async def list_versions(self, name: str) -> list[VersionEntry]:
+        async def alist_versions(self, name: str) -> list[VersionEntry]:
             return [VersionEntry(id="1", aliases=[])]
 
-        async def get_template(self, name: str, version: str) -> PromptTemplate:
+        async def aget_template(self, name: str, version: str) -> PromptTemplate:
             self.calls += 1
             return PromptTemplate(
                 id=name,
@@ -124,8 +126,8 @@ async def test_load_caches_result():
 
     loader = CountingLoader()
     engine = PromptEngine([loader])
-    tmpl1 = await engine.load("demo")
-    tmpl2 = await engine.load("demo")
+    tmpl1 = await engine.aload("demo")
+    tmpl2 = await engine.aload("demo")
     assert tmpl1 is tmpl2
     assert loader.calls == 1
 
@@ -134,7 +136,7 @@ async def test_load_caches_result():
 async def test_load_missing_raises():
     engine = PromptEngine([FileSystemLoader(Path("./prompts"))])
     with pytest.raises(TemplateNotFoundError):
-        await engine.load("nonexistent")
+        await engine.aload("nonexistent")
 
 
 @pytest.mark.asyncio
@@ -155,25 +157,25 @@ variants:
         memory_templates={"x": {"yaml": yaml_text}},
         default_model_config=global_cfg,
     )
-    
+
     # 使用patch监控create_client
     with patch("prompti.engine.create_client") as mock_create_client:
         # 设置模拟客户端
         dummy_client = DummyClient(global_cfg)
         mock_create_client.return_value = dummy_client
-        
-        # 创建引擎和运行测试
+
+        # 创建引擎和运行测试 - 使用 acompletion 替代 run
         engine = PromptEngine.from_setting(setting)
-        out = [m async for m in engine.run("x", {}, variant="base", stream=False)]
-        
+        out = [m async for m in engine.acompletion("x", {}, variant="base", stream=False)]
+
         # 验证结果
         assert isinstance(out[0], ModelResponse)
         assert out[0].choices[0].message.content == "ok"
-        
+
         # 验证使用了全局配置
         mock_create_client.assert_called_once()
         cfg_arg = mock_create_client.call_args[0][0]
-        assert cfg_arg.provider == "dummy" 
+        assert cfg_arg.provider == "dummy"
         assert cfg_arg.model == "z"
 
 
@@ -198,17 +200,17 @@ variants:
         memory_templates={"x": {"yaml": yaml_text}},
         default_model_config=global_cfg,
     )
-    
+
     # 使用patch监控create_client
     with patch("prompti.engine.create_client") as mock_create_client:
         # 设置模拟客户端
         dummy_client = DummyClient(ModelConfig(provider="dummy", model="x"))
         mock_create_client.return_value = dummy_client
-        
-        # 创建引擎和运行测试
+
+        # 创建引擎和运行测试 - 使用 acompletion 替代 run
         engine = PromptEngine.from_setting(setting)
-        [m async for m in engine.run("x", {}, variant="base", stream=False)]
-        
+        [m async for m in engine.acompletion("x", {}, variant="base", stream=False)]
+
         # 验证使用了变体配置而不是全局配置
         mock_create_client.assert_called_once()
         cfg_arg = mock_create_client.call_args[0][0]
@@ -230,10 +232,10 @@ variants:
 """
     # 创建没有全局配置的引擎
     engine = PromptEngine([MemoryLoader({"x": {"yaml": yaml_text}})])
-    
-    # 没有模型配置应该引发错误
+
+    # 没有模型配置应该引发错误 - 使用 acompletion 替代 run
     with pytest.raises(ValueError, match="ModelConfig required but not provided in template or globally"):
-        [m async for m in engine.run("x", {}, variant="base", stream=False)]
+        [m async for m in engine.acompletion("x", {}, variant="base", stream=False)]
 
 
 @pytest.mark.asyncio
@@ -250,7 +252,7 @@ variants:
 """
 
     engine = PromptEngine([MemoryLoader({"greet": {"yaml": yaml_text}})])
-    msgs = await engine.format("greet", {"name": "Ada"}, variant="base")
+    msgs = await engine.aformat("greet", {"name": "Ada"}, variant="base")
     assert isinstance(msgs, list)
     assert len(msgs) == 1
     assert msgs[0].get("role") == "user"
@@ -265,38 +267,54 @@ async def test_direct_messages():
         Message(role="system", content="You are a helpful assistant"),
         Message(role="user", content="Hello!")
     ]
-    
+
     # 创建模型配置
     model_cfg = ModelConfig(provider="dummy", model="direct_model")
-    
+
+    # 创建一个简单的模板对象用于variant配置
+    dummy_template = PromptTemplate(
+        id="direct",
+        name="direct",
+        description="Direct messages template",
+        version="1",
+        variants={
+            "default": Variant(
+                selector=[],
+                model_config=model_cfg,
+                messages=[],
+            )
+        },
+    )
+
     # 使用patch监控create_client
     with patch("prompti.engine.create_client") as mock_create_client:
         # 设置模拟客户端
         dummy_client = DummyClient(model_cfg)
         mock_create_client.return_value = dummy_client
-        
+
         # 创建引擎
         engine = PromptEngine([])  # 不需要加载器
-        
-        # 运行测试，使用直接传入的messages
-        out = [m async for m in engine.run(
-            template_name="dummy",  # 只是一个占位符
-            variables={},  # 不会被使用
+
+        # 运行测试，使用直接传入的messages和template对象
+        out = [m async for m in engine.acompletion(
+            template_name="direct",
+            variables={},
+            template=dummy_template,  # 传递模板对象而不是解析
             model_cfg=model_cfg,
             messages=direct_messages,
             stream=False
         )]
-        
+
         # 验证结果
         assert isinstance(out[0], ModelResponse)
         assert out[0].choices[0].message.content == "ok"
-        
+
         # 验证传递给create_client的参数
         mock_create_client.assert_called_once()
         cfg_arg = mock_create_client.call_args[0][0]
         assert cfg_arg.provider == "dummy"
         assert cfg_arg.model == "direct_model"
-        
+
         # 由于我们无法直接访问客户端的run方法调用参数
         # 我们只验证模型配置和结果
         assert out[0].model == "direct_model"

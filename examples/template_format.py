@@ -12,16 +12,14 @@ async def main() -> None:
         import litellm
     except ImportError as e:
         raise ImportError("litellm is required for this example. Install with: pip install 'prompti[litellm]'") from e
-
-    engine = PromptEngine.from_setting(Setting())
+    engine = PromptEngine.from_setting(Setting.from_file("examples/configs/settings.yaml"))
 
     # Format the template directly as OpenAI messages and send
     messages = await engine.format(
         "support_reply",
-        {"name": "Ada", "issue": "login failed"},
-        format="openai",
+        {"name": "Ada", "issue": "login failed"}
     )
-
+    print(messages)
     response = await litellm.acompletion(
         model=os.getenv("MODEL_NAME", "gpt-3.5-turbo"),
         messages=messages,

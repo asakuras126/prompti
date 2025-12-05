@@ -53,6 +53,7 @@ class Variant(BaseModel):
 
     selector: list[str] = []
     model_cfg: ModelConfig | None = Field(None)
+    model_strategy: dict[str, Any] | None = Field(None)  # 高级模型策略配置
     messages: list[dict]
     required_variables: list[str] = []
 
@@ -65,15 +66,16 @@ class PromptTemplate(BaseModel):
     version: str | None = None
     aliases: list[str] = []
     variants: dict[str, Variant]
+    variant_router: dict[str, Any] | None = None
     id: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PromptTemplate":
         """Create a PromptTemplate instance from a dictionary.
-
+        
         This method handles the conversion of the template data dictionary
         (typically from the database) into a proper PromptTemplate instance.
-
+        
         Args:
             data: Dictionary containing template data with the following structure:
                 - name: Template name
@@ -87,10 +89,10 @@ class PromptTemplate(BaseModel):
                     - required_variables: List of required variable names
                     - model_cfg: Model configuration dictionary
                     - tags: Additional tags/metadata
-
+        
         Returns:
             PromptTemplate: A properly constructed PromptTemplate instance
-
+            
         Example:
             >>> template_dict = {
             ...     "name": "customer-service",
@@ -117,6 +119,7 @@ class PromptTemplate(BaseModel):
         version = data.get("version")
         template_id = data.get("template_id") or data.get("id")
         aliases = data.get("alias", []) or data.get("aliases", [])
+        variant_router = data.get("variant_router")
 
         # Ensure aliases is a list
         if not isinstance(aliases, list):
@@ -133,17 +136,26 @@ class PromptTemplate(BaseModel):
                 messages = variant_data.get("messages_template", [])
                 required_variables = variant_data.get("required_variables", [])
                 model_cfg_data = variant_data.get("model_cfg")
+                model_strategy_data = variant_data.get("model_strategy")
+                
+                # 兼容性处理：如果model_strategy为空，但model_cfg中包含model_strategy，则从那里获取
+                if model_strategy_data is None and model_cfg_data and isinstance(model_cfg_data, dict):
+                    model_strategy_data = model_cfg_data.get("model_strategy")
                 tags = variant_data.get("tags", {})
 
                 # Create ModelConfig if present
                 model_cfg = None
                 if model_cfg_data and isinstance(model_cfg_data, dict):
-                    model_cfg = ModelConfig(**model_cfg_data)
+                    # 过滤掉model_strategy字段，避免传递给ModelConfig
+                    clean_model_cfg = {k: v for k, v in model_cfg_data.items() if k != "model_strategy"}
+                    if clean_model_cfg:  # 只有在有其他配置时才创建ModelConfig
+                        model_cfg = ModelConfig(**clean_model_cfg)
 
                 # Create Variant instance
                 variant = Variant(
                     selector=tags.get("selector", []) if isinstance(tags, dict) else [],
                     model_cfg=model_cfg,
+                    model_strategy=model_strategy_data,
                     messages=messages,
                     required_variables=required_variables
                 )
@@ -156,17 +168,27 @@ class PromptTemplate(BaseModel):
                     messages = variant_data.get("messages", variant_data.get("messages_template", []))
                     required_variables = variant_data.get("required_variables", [])
                     model_cfg_data = variant_data.get("model_cfg")
+                    model_strategy_data = variant_data.get("model_strategy")
+                    
+                    # 兼容性处理：如果model_strategy为空，但model_cfg中包含model_strategy，则从那里获取
+                    if model_strategy_data is None and model_cfg_data and isinstance(model_cfg_data, dict):
+                        model_strategy_data = model_cfg_data.get("model_strategy")
+                        
                     selector = variant_data.get("selector", [])
 
                     # Create ModelConfig if present
                     model_cfg = None
                     if model_cfg_data and isinstance(model_cfg_data, dict):
-                        model_cfg = ModelConfig(**model_cfg_data)
+                        # 过滤掉model_strategy字段，避免传递给ModelConfig
+                        clean_model_cfg = {k: v for k, v in model_cfg_data.items() if k != "model_strategy"}
+                        if clean_model_cfg:  # 只有在有其他配置时才创建ModelConfig
+                            model_cfg = ModelConfig(**clean_model_cfg)
 
                     # Create Variant instance
                     variant = Variant(
                         selector=selector,
                         model_cfg=model_cfg,
+                        model_strategy=model_strategy_data,
                         messages=messages,
                         required_variables=required_variables
                     )
@@ -188,6 +210,7 @@ class PromptTemplate(BaseModel):
             description=description,
             version=version,
             aliases=aliases,
+            variant_router=variant_router,
             variants=variants,
             id=template_id
         )
@@ -221,12 +244,15 @@ class PromptTemplate(BaseModel):
             
             """
             var = self.variants[variant]
+            if not variables:
+                return var.messages, var
 
             # Render messages with Jinja
             rendered_messages = []
             for msg in var.messages:
                 role = msg.get("role")
                 content = msg.get("content", [])
+                tool_calls = msg.get("tool_calls", [])
 
                 # Handle content rendering
                 if isinstance(content, list):
@@ -274,18 +300,24 @@ class PromptTemplate(BaseModel):
                 # 对于列表类型的content，检查是否有有效内容
                 # 对于字符串类型的content，检查是否为空
                 should_add_message = False
-                if isinstance(rendered_content, list):
+                if isinstance(rendered_content, list) and len(rendered_content) > 0:
                     # 如果是列表且有有效内容项
-                    should_add_message = len(rendered_content) > 0
+                    should_add_message = True
+                elif tool_calls:
+                    should_add_message = True
                 else:
                     # 如果是字符串且不为空
                     should_add_message = rendered_content and str(rendered_content).strip()
-
                 if should_add_message:
-                    rendered_messages.append({
+                    rendered_message = {
                         "role": role,
                         "content": rendered_content
-                    })
+                    }
+                    if tool_calls := msg.get("tool_calls", []):
+                        rendered_message["tool_calls"] = tool_calls
+                    if tool_call_id := msg.get("tool_call_id"):
+                        rendered_message["tool_call_id"] = tool_call_id
+                    rendered_messages.append(rendered_message)
 
             return rendered_messages, var
         finally:

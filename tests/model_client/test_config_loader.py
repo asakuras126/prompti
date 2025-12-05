@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from prompti.model_client.base import ModelConfig
-from prompti.model_client.config_loader import (
+from prompti.loader.model_config_loader import (
     FileModelConfigLoader,
     HTTPModelConfigLoader,
     ModelConfigNotFoundError,
@@ -42,18 +42,24 @@ class TestFileModelConfigLoader:
             
             # Verify models were loaded correctly
             assert len(loader.models) == 2
+            assert "gpt-4" in loader.models
+            assert "claude-3-opus" in loader.models
             
             # Check first model
-            assert loader.models[0].provider == "openai"
-            assert loader.models[0].model == "gpt-4"
-            assert loader.models[0].api_key == "test_key1"
-            assert loader.models[0].api_url == "https://api.openai.com/v1"
+            gpt4_configs = loader.models["gpt-4"]
+            assert len(gpt4_configs) == 1
+            assert gpt4_configs[0].provider == "openai"
+            assert gpt4_configs[0].model == "gpt-4"
+            assert gpt4_configs[0].api_key == "test_key1"
+            assert gpt4_configs[0].api_url == "https://api.openai.com/v1"
             
             # Check second model
-            assert loader.models[1].provider == "anthropic"
-            assert loader.models[1].model == "claude-3-opus"
-            assert loader.models[1].api_key == "test_key2"
-            assert loader.models[1].api_url == "https://api.anthropic.com/v1"
+            claude_configs = loader.models["claude-3-opus"]
+            assert len(claude_configs) == 1
+            assert claude_configs[0].provider == "anthropic"
+            assert claude_configs[0].model == "claude-3-opus"
+            assert claude_configs[0].api_key == "test_key2"
+            assert claude_configs[0].api_url == "https://api.anthropic.com/v1"
         finally:
             # Clean up
             os.unlink(temp_file_path)
@@ -118,15 +124,19 @@ class TestFileModelConfigLoader:
         """Test retrieving model config that exists."""
         # Create loader with mock data
         loader = FileModelConfigLoader()
-        loader.models = [
-            ModelConfig(provider="openai", model="gpt-4", api_key="test_key"),
-            ModelConfig(provider="anthropic", model="claude-3", api_key="test_key2")
-        ]
-        
-        # Retrieve model config
-        config = loader.get_model_config("gpt-4")
-        
+        loader.models = {
+            "gpt-4": [ModelConfig(provider="openai", model="gpt-4", api_key="test_key")],
+            "claude-3": [ModelConfig(provider="anthropic", model="claude-3", api_key="test_key2")]
+        }
+        # Set last loaded time to avoid reloading
+        loader._last_loaded = 9999999999  # Far future timestamp
+
+        # Retrieve model config (returns a list)
+        configs = loader.get_model_config("gpt-4")
+
         # Verify
+        assert len(configs) == 1
+        config = configs[0]
         assert config.provider == "openai"
         assert config.model == "gpt-4"
         assert config.api_key == "test_key"
@@ -135,15 +145,21 @@ class TestFileModelConfigLoader:
         """Test retrieving model config with provider specified."""
         # Create loader with mock data
         loader = FileModelConfigLoader()
-        loader.models = [
-            ModelConfig(provider="openai", model="gpt-4", api_key="test_key1"),
-            ModelConfig(provider="anthropic", model="gpt-4", api_key="test_key2")  # Same model name, different provider
-        ]
-        
-        # Retrieve model config with provider
-        config = loader.get_model_config("gpt-4", provider="anthropic")
-        
-        # Verify
+        loader.models = {
+            "gpt-4": [
+                ModelConfig(provider="openai", model="gpt-4", api_key="test_key1"),
+                ModelConfig(provider="anthropic", model="gpt-4", api_key="test_key2")  # Same model name, different provider
+            ]
+        }
+        # Set last loaded time to avoid reloading
+        loader._last_loaded = 9999999999  # Far future timestamp
+
+        # Retrieve model config with provider (returns a list with provider filtered)
+        configs = loader.get_model_config("gpt-4", provider="anthropic")
+
+        # Verify - should prioritize anthropic provider
+        assert len(configs) >= 1
+        config = configs[0]
         assert config.provider == "anthropic"
         assert config.model == "gpt-4"
         assert config.api_key == "test_key2"
@@ -152,9 +168,11 @@ class TestFileModelConfigLoader:
         """Test error when model config isn't found."""
         # Create loader with mock data
         loader = FileModelConfigLoader()
-        loader.models = [
-            ModelConfig(provider="openai", model="gpt-4", api_key="test_key")
-        ]
+        loader.models = {
+            "gpt-4": [ModelConfig(provider="openai", model="gpt-4", api_key="test_key")]
+        }
+        # Set last loaded time to avoid reloading
+        loader._last_loaded = 9999999999  # Far future timestamp
         
         # Attempt to retrieve non-existent model
         with pytest.raises(ModelConfigNotFoundError, match="Model configuration 'gpt-3.5-turbo' not found"):
@@ -164,10 +182,12 @@ class TestFileModelConfigLoader:
         """Test listing available models."""
         # Create loader with mock data
         loader = FileModelConfigLoader()
-        loader.models = [
-            ModelConfig(provider="openai", model="gpt-4"),
-            ModelConfig(provider="anthropic", model="claude-3")
-        ]
+        loader.models = {
+            "gpt-4": [ModelConfig(provider="openai", model="gpt-4")],
+            "claude-3": [ModelConfig(provider="anthropic", model="claude-3")]
+        }
+        # Set last loaded time to avoid reloading
+        loader._last_loaded = 9999999999  # Far future timestamp
         
         # List models
         models = loader.list_models()
@@ -185,20 +205,25 @@ class TestHTTPModelConfigLoader:
         mock_client = MagicMock()
         
         # Set up the mock responses directly in the mock client method
-        mock_model_data = [
-            {
-                "provider": "openai", 
-                "name": "gpt-4",
-                "url": "https://api.openai.com/v1",
-                "llm_tokens": ["openai_token"]
-            },
-            {
-                "provider": "anthropic",
-                "name": "claude-3",
-                "url": "https://api.anthropic.com/v1",
-                "llm_tokens": ["anthropic_token"]
-            }
-        ]
+        # 分组格式的mock数据: {"model_name": [model1, model2, ...]}
+        mock_model_data = {
+            "gpt-4": [
+                {
+                    "provider": "openai", 
+                    "name": "gpt-4",
+                    "url": "https://api.openai.com/v1",
+                    "llm_tokens": ["openai_token"]
+                }
+            ],
+            "claude-3": [
+                {
+                    "provider": "anthropic",
+                    "name": "claude-3",
+                    "url": "https://api.anthropic.com/v1",
+                    "llm_tokens": ["anthropic_token"]
+                }
+            ]
+        }
         
         mock_token_data = [
             {
@@ -214,13 +239,13 @@ class TestHTTPModelConfigLoader:
         # First call to get returns model list
         model_response = MagicMock()
         model_response.status_code = 200
-        model_response.json.return_value = mock_model_data
+        model_response.json.return_value = {"data": mock_model_data}
         model_response.raise_for_status.return_value = None
         
         # Second call to get returns token list
         token_response = MagicMock()
         token_response.status_code = 200
-        token_response.json.return_value = mock_token_data
+        token_response.json.return_value = {"data": mock_token_data}
         token_response.raise_for_status.return_value = None
         
         mock_client.get.side_effect = [model_response, token_response]
@@ -231,23 +256,29 @@ class TestHTTPModelConfigLoader:
         
         # Verify request calls
         assert mock_client.get.call_count == 2
-        mock_client.get.assert_any_call("http://example.com/api/model/list")
-        mock_client.get.assert_any_call("http://example.com/api/llm-token/list")
+        mock_client.get.assert_any_call(url="http://example.com/api/model/grouped", headers={'Authorization': 'Bearer None'})
+        mock_client.get.assert_any_call(url="http://example.com/api/llm-token/list", headers={'Authorization': 'Bearer None'})
         
         # Verify models were loaded
         assert len(loader.models) == 2
+        assert "gpt-4" in loader.models
+        assert "claude-3" in loader.models
         
         # Check first model
-        assert loader.models[0].provider == "openai"
-        assert loader.models[0].model == "gpt-4"
-        assert loader.models[0].api_url == "https://api.openai.com/v1"
-        assert loader.models[0].api_key == "openai_key"
+        gpt4_configs = loader.models["gpt-4"]
+        assert len(gpt4_configs) == 1
+        assert gpt4_configs[0].provider == "openai"
+        assert gpt4_configs[0].model == "gpt-4"
+        assert gpt4_configs[0].api_url == "https://api.openai.com/v1"
+        assert gpt4_configs[0].api_key == "openai_key"
         
         # Check second model
-        assert loader.models[1].provider == "anthropic"
-        assert loader.models[1].model == "claude-3"
-        assert loader.models[1].api_url == "https://api.anthropic.com/v1"
-        assert loader.models[1].api_key == "anthropic_key"
+        claude3_configs = loader.models["claude-3"]
+        assert len(claude3_configs) == 1
+        assert claude3_configs[0].provider == "anthropic"
+        assert claude3_configs[0].model == "claude-3"
+        assert claude3_configs[0].api_url == "https://api.anthropic.com/v1"
+        assert claude3_configs[0].api_key == "anthropic_key"
     
     def test_load_http_error(self):
         """Test error handling when HTTP request fails."""
@@ -291,15 +322,19 @@ class TestHTTPModelConfigLoader:
         """Test retrieving model config that exists."""
         # Create loader with mock data
         loader = HTTPModelConfigLoader("http://example.com/api")
-        loader.models = [
-            ModelConfig(provider="openai", model="gpt-4", api_key="test_key"),
-            ModelConfig(provider="anthropic", model="claude-3", api_key="test_key2")
-        ]
-        
-        # Retrieve model config
-        config = loader.get_model_config("gpt-4")
-        
+        loader.models = {
+            "gpt-4": [ModelConfig(provider="openai", model="gpt-4", api_key="test_key")],
+            "claude-3": [ModelConfig(provider="anthropic", model="claude-3", api_key="test_key2")]
+        }
+        # Set last loaded time to avoid reloading
+        loader._last_loaded = 9999999999  # Far future timestamp
+
+        # Retrieve model config (returns a list)
+        configs = loader.get_model_config("gpt-4")
+
         # Verify
+        assert len(configs) == 1
+        config = configs[0]
         assert config.provider == "openai"
         assert config.model == "gpt-4"
         assert config.api_key == "test_key"
@@ -308,9 +343,11 @@ class TestHTTPModelConfigLoader:
         """Test error when model config isn't found."""
         # Create loader with mock data
         loader = HTTPModelConfigLoader("http://example.com/api")
-        loader.models = [
-            ModelConfig(provider="openai", model="gpt-4", api_key="test_key")
-        ]
+        loader.models = {
+            "gpt-4": [ModelConfig(provider="openai", model="gpt-4", api_key="test_key")]
+        }
+        # Set last loaded time to avoid reloading
+        loader._last_loaded = 9999999999  # Far future timestamp
         
         # Attempt to retrieve non-existent model
         with pytest.raises(ModelConfigNotFoundError, match="Model configuration 'gpt-3.5-turbo' not found"):
@@ -320,10 +357,12 @@ class TestHTTPModelConfigLoader:
         """Test listing available models."""
         # Create loader with mock data
         loader = HTTPModelConfigLoader("http://example.com/api")
-        loader.models = [
-            ModelConfig(provider="openai", model="gpt-4"),
-            ModelConfig(provider="anthropic", model="claude-3")
-        ]
+        loader.models = {
+            "gpt-4": [ModelConfig(provider="openai", model="gpt-4")],
+            "claude-3": [ModelConfig(provider="anthropic", model="claude-3")]
+        }
+        # Set last loaded time to avoid reloading
+        loader._last_loaded = 9999999999  # Far future timestamp
         
         # List models
         models = loader.list_models()

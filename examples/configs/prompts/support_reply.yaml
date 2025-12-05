@@ -1,0 +1,23 @@
+name: support_reply
+description: Customer Support Reply
+version: "1.0"
+aliases: ["stable", "prod"]
+variants:
+  default:
+    selector: []
+    required_variables: ["name", "issue"]
+    model_cfg:
+      provider: openai
+      model: gpt-4o
+      temperature: 0.1
+      top_p: 0.1
+      max_tokens: 256
+      max_tpp: 1209
+    messages:
+      - role: system
+        content: You are a customer-support assistant.
+      - role: user
+        content:
+          - type: text
+            text: |
+              Hi {{ name }}, your ticket "{{ issue }}" has been created.

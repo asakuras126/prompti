@@ -1,6 +1,6 @@
 [project]
 name = "prompti"
-version = "0.8.15"
+version = "0.11.20"
 description = "Provider-agnostic asynchronous prompt engine"
 authors = [
   { name = "wolvever" }, { name = "gaoxiaoyang02" }
@@ -9,7 +9,7 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 dependencies = [
-  "pydantic>=2",
+  "pydantic==2.11.7",
   "jinja2>=3",
   "async-lru",
   "httpx[http2]>=0.25",
@@ -19,17 +19,25 @@ dependencies = [
   "prometheus-client",
   "opentelemetry-api",
   "opentelemetry-sdk",
+  "opentelemetry-exporter-otlp",
   "xxhash",
   "python-dotenv>=1.1.0",
   "semantic-version>=2.10.0",
   "pytest-asyncio",
+  "elasticsearch==7.17.9",
+  "opensearch-py==2.3.1",
+  "litellm==1.79.1",
+  "boto3==1.40.27",
+  "json_repair==0.48.0",
+  "openai==2.7.1",
+  "google-cloud-aiplatform==1.126.1",
+  "loguru>=0.7.0",
+  "cryptography==43.0.3"
 ]
 
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio"]
-litellm = [
-    "litellm>=1.73.1",
-]
+
 
 [tool.uv]
 # uv is used for dependency management during development

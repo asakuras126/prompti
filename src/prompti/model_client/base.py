@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from enum import Enum
@@ -15,18 +14,332 @@ from opentelemetry import trace
 from opentelemetry.baggage import set_baggage
 from prometheus_client import Counter, Gauge, Histogram
 from pydantic import BaseModel, Field, model_validator
-from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 from collections.abc import Generator
 
 from ..message import Message, ModelResponse, StreamingModelResponse
 from typing import Optional
+from ..logger import get_logger
+
+
+
+
+def should_retry_error(error: Exception) -> bool:
+    """判断错误是否应该重试。
+
+    对网络相关错误、服务器临时错误、特定的配额/速率限制错误和上下文超长错误进行重试。
+    上下文超长错误也应该重试，因为会使用不同的模型兜底，后续的模型可能有更长的上下文。
+
+    Args:
+        error: 捕获到的异常
+
+    Returns:
+        bool: True表示应该重试，False表示不应该重试
+    """
+    import httpx
+
+    # 检查是否为上下文长度超限错误，这类错误也应该重试（用于模型fallback）
+    if is_context_length_error(str(error)):
+        return True
+    
+    # 检查特定的异常类型
+    # 对于LiteLLM的异常，先检查类型
+    try:
+        import litellm.exceptions
+        if isinstance(error, (
+            litellm.exceptions.RateLimitError,
+            litellm.exceptions.APIConnectionError,
+            litellm.exceptions.Timeout,
+            litellm.exceptions.ServiceUnavailableError,
+            litellm.exceptions.InternalServerError,
+            litellm.exceptions.APIError,
+        )):
+            return True
+    except ImportError:
+        pass  # LiteLLM未安装，跳过检查
+    
+    # 对网络连接错误进行重试
+    if isinstance(error, httpx.RequestError):
+        # 进一步判断具体的网络错误类型
+        if isinstance(error, (
+            httpx.ConnectError,         # 连接失败
+            httpx.TimeoutException,     # 超时
+            httpx.ReadError,            # 读取错误
+            httpx.WriteError,           # 写入错误
+            httpx.PoolTimeout,          # 连接池超时
+            httpx.ConnectTimeout,       # 连接超时
+            httpx.ReadTimeout,          # 读取超时
+            httpx.WriteTimeout,         # 写入超时
+            httpx.RemoteProtocolError,  # 远程协议错误（包括服务器断开连接）
+        )):
+            return True
+            
+    # 对特定的HTTP状态码进行重试（服务器临时错误）
+    if isinstance(error, httpx.HTTPStatusError):
+        status_code = error.response.status_code
+        
+        # 对服务器临时错误和认证错误进行重试/fallback
+        if status_code in (
+            401,  # Unauthorized (API key issues, should fallback to other providers)
+            429,  # Too Many Requests (Rate Limiting)
+            500,  # Internal Server Error
+            502,  # Bad Gateway
+            503,  # Service Unavailable
+            504,  # Gateway Timeout
+            507,  # Insufficient Storage
+            508,  # Loop Detected
+            509,  # Bandwidth Limit Exceeded
+            510,  # Not Extended
+            511,  # Network Authentication Required
+            520,  # Unknown Error (Cloudflare)
+            521,  # Web Server Is Down (Cloudflare)
+            522,  # Connection Timed Out (Cloudflare)
+            523,  # Origin Is Unreachable (Cloudflare)
+            524,  # A Timeout Occurred (Cloudflare)
+            525,  # SSL Handshake Failed (Cloudflare)
+            526,  # Invalid SSL Certificate (Cloudflare)
+            527,  # Railgun Error (Cloudflare)
+            530,  # Origin DNS Error (Cloudflare)
+        ):
+            return True
+    
+    # 检查异常消息中是否包含特定的错误关键词
+    try:
+        error_message = str(error).lower()
+        
+        # 服务器断开连接错误
+        server_disconnect_keywords = [
+            "server disconnected without sending a response",
+            "server disconnected",
+            "connection broken",
+            "remote end closed connection",
+            "connection reset by peer",
+            "timed out",
+            "connection"
+        ]
+        
+        # 配额和速率限制错误
+        quota_keywords = [
+            "quota exceeded",
+            "quota_exceeded", 
+            "quota limit",
+            "rate limit",
+            "rate_limit",
+            "request rate limit exceeded",
+            "too many tokens",
+            "throttled",
+            "throttling",
+            "model is getting throttled",
+            "try your request again",
+            "retry your request",
+            "resource exhausted",
+            "insufficient capacity",
+        ]
+        
+        # Bedrock 特定错误
+        bedrock_keywords = [
+            "throttlingexception",
+            "servicequotaexceedederror",
+            "modelnotreadyexception",
+            "internalserverexception",
+            "modeltimeoutexception",
+            "modelstreamingexception",
+            "accessdeniedexception",  # 某些情况下可能是临时的
+            "validationexception",  # 某些情况下可重试
+            "output blocked by content filtering policy",  # 内容被内容过滤策略阻止
+            "content filtering policy",  # 内容过滤策略相关错误
+        ]
+        
+        # AWS 通用错误
+        aws_keywords = [
+            "requestlimitexceeded",
+            "toomanyrequests", 
+            "slowdown",
+            "provisioned throughput exceeded",
+            "capacity not available",
+        ]
+        
+        # OpenAI/Azure 错误
+        openai_keywords = [
+            "rate_limit_exceeded",
+            "insufficient_quota",
+            "model_overloaded",
+            "server_error",
+            "deployment_not_found",  # Azure specific
+            "content_filter",  # 某些情况下可重试
+            "internal error",  # OpenAI 内部错误
+            "unsupported parameter",  # 参数不支持，可能其他模型支持
+            "not supported with this model",  # 当前模型不支持，可以尝试其他模型
+            "invalid parameter",  # 无效参数，可能是模型特定的
+            "parameter is not supported",  # 参数不支持的另一种表述
+        ]
+        
+        # 网络和服务不可用错误
+        service_unavailable_keywords = [
+            "service unavailable",
+            "service_unavailable",
+            "temporarily unavailable",
+            "maintenance",
+            "overloaded",
+            "busy",
+            "capacity",
+            "backoff",
+            "please retry",
+            "try again",
+            "retry after",
+            "wait",
+            "cooling down",
+        ]
+        
+        # 模型特定错误
+        model_specific_keywords = [
+            "model busy",
+            "model unavailable", 
+            "model not ready",
+            "model loading",
+            "model timeout",
+            "inference timeout",
+            "processing timeout",
+            "request timeout",
+            "execution timeout",
+        ]
+        
+        # 合并所有需要重试的错误关键词
+        retry_keywords = (server_disconnect_keywords + quota_keywords + 
+                         bedrock_keywords + aws_keywords + openai_keywords + 
+                         service_unavailable_keywords + model_specific_keywords)
+        
+        if any(keyword in error_message for keyword in retry_keywords):
+            return True
+            
+    except Exception:
+        # 如果获取错误消息失败，继续其他判断
+        pass
+    
+    return False
+
+
+def calculate_retry_delay(attempt: int, max_delay: int = 8, error: Exception = None) -> int:
+    """计算重试延迟时间（指数退避）。
+    
+    Args:
+        attempt: 当前尝试次数（从0开始）
+        max_delay: 最大延迟时间（秒）
+        error: 可选的异常对象，用于基于错误类型调整延迟
+        
+    Returns:
+        int: 延迟时间（秒）
+    """
+    base_delay = min(2 ** attempt, max_delay)
+    
+    # 根据错误类型调整延迟时间
+    if error is not None:
+        error_message = str(error).lower()
+        
+        # 对于限流错误，使用更长的延迟
+        if any(keyword in error_message for keyword in [
+            "throttled", "throttling", "rate limit", "quota exceeded", 
+            "too many requests", "too many tokens"
+        ]):
+            # 限流错误使用保守的退避策略
+            return min(base_delay + 3, 15)  # 基础延迟+3秒，最多15秒
+        
+        # 对于服务不可用错误，使用中等延迟
+        elif any(keyword in error_message for keyword in [
+            "service unavailable", "overloaded", "busy", "capacity"
+        ]):
+            return min(base_delay + 1, 12)  # 基础延迟+1秒，最多12秒
+        
+        # 对于网络连接错误，使用基础延迟
+        elif any(keyword in error_message for keyword in [
+            "connection", "timeout", "network"
+        ]):
+            return min(base_delay, 8)  # 使用基础延迟，最多8秒
+    
+    return base_delay
+
+
+
+def is_context_length_error(message: str) -> bool:
+    """检测是否为上下文长度超限错误。
+    
+    Args:
+        message: 错误消息字符串
+        
+    Returns:
+        bool: True表示是上下文长度错误，False表示不是
+    """
+    message_lower = message.lower()
+    return (
+        "input length and `max_tokens` exceed context limit" in message_lower or
+        "context limit" in message_lower or
+        "maximum context length" in message_lower or
+        "context_length_exceeded" in message_lower or
+        "context window" in message_lower or
+        "input characters limit" in message_lower or
+        "too long" in message_lower
+    )
+
+
+def handle_model_client_error(error: Exception, is_streaming: bool, create_error_response_func) -> Union['ModelResponse', 'StreamingModelResponse']:
+    """处理model client的最终错误（不再重试）。
+    
+    Args:
+        error: 异常对象
+        is_streaming: 是否为流式响应
+        create_error_response_func: 创建错误响应的函数
+        
+    Returns:
+        错误响应对象
+    """
+    import httpx
+
+    logger = get_logger("model_client")
+    
+    if isinstance(error, httpx.HTTPStatusError):
+        # HTTP错误（4xx, 5xx）
+        error_detail = "Unknown error"
+        error_type = "http_error"
+        error_code = f"http_{error.response.status_code}"
+        try:
+            if error.response.content:
+                error_data = error.response.json()
+                if "error" in error_data:
+                    error_obj = error_data["error"]
+                    error_detail = error_obj.get("message", str(error_obj))
+                    error_type = error_obj.get("type", "http_error")
+                    error_code = error_obj.get("code", f"http_{error.response.status_code}")
+                else:
+                    error_detail = str(error_data)
+            else:
+                error_detail = f"HTTP {error.response.status_code}"
+        except Exception:
+            error_detail = f"HTTP {error.response.status_code}: {error.response.text}"
+
+        logger.error(f"API HTTP error: {error_detail}")
+        return create_error_response_func(error_detail, is_streaming=is_streaming, 
+                                        error_type=error_type, error_code=error_code)
+    
+    elif isinstance(error, httpx.RequestError):
+        # 网络连接错误
+        error_msg = f"Network error: {str(error)}"
+        logger.error(error_msg)
+        return create_error_response_func(error_msg, is_streaming=is_streaming,
+                                        error_type="network_error", error_code="request_failed")
+    
+    else:
+        # 其他错误
+        error_msg = f"Unexpected error: {str(error)}"
+        logger.error(error_msg)
+        return create_error_response_func(error_msg, is_streaming=is_streaming,
+                                        error_type="internal_error", error_code="unexpected_error")
 
 
 class ModelConfig(BaseModel):
     """Static connection and default generation parameters."""
 
     provider: Optional[str] | None = None
-    model: Optional[str] | None = None
+    model: Optional[str] | None = None  # 聚合模型名称（用于模型分组和查找）
+    model_value: Optional[str] | None = None  # 真实调用的模型名称
     api_key: Optional[str] | None = None
     api_url: Optional[str] | None = None
 
@@ -35,8 +348,33 @@ class ModelConfig(BaseModel):
     top_p: Optional[float] | None = None
     max_tokens: Optional[int] | None = None
     
+    # load balancing weight for multiple providers of the same model
+    weight: Optional[int] = 50
+    
+    # extension fields from promptstore model configuration
+    ext: dict[str, Any] = {}
+    
+    # token configuration from llm_tokens (credentials, etc.)
+    token_config: dict[str, Any] = {}
+    
     # extra parameters for client construction
     extra_params: dict[str, Any] = {}
+    
+    def get_aggregated_model_name(self) -> str:
+        """Get the model name to use for aggregation purposes.
+        
+        Returns:
+            str: The aggregated model name (model field).
+        """
+        return self.model or ""
+    
+    def get_actual_model_name(self) -> str:
+        """Get the actual model name for API calls.
+        
+        Returns:
+            str: The actual model name (model_value field), fallback to model if not set.
+        """
+        return self.model_value or self.model or ""
 
 
 class ToolSpec(BaseModel):
@@ -56,6 +394,22 @@ class ToolChoice(str, Enum):
     FORCE = "force"
 
 
+class ModelControlParams(BaseModel):
+    """Dynamic model control parameters for runtime adjustment."""
+    
+    # Weight overrides for specific providers or models
+    # Format: {"provider_name": weight} or {"provider_name/model_name": weight}
+    weight_overrides: dict[str, int] | None = None
+    
+    # Disabled providers or models
+    # Format: ["provider_name"] or ["provider_name/model_name"]
+    disabled_models: list[str] | None = None
+    
+    # Enabled providers or models (if specified, only these will be used)
+    # Format: ["provider_name"] or ["provider_name/model_name"]
+    enabled_models: list[str] | None = None
+
+
 class ToolParams(BaseModel):
     """Tool catalogue and invocation configuration."""
 
@@ -71,6 +425,9 @@ class RunParams(BaseModel):
 
     messages: list[Message]
     tool_params: ToolParams | list[ToolSpec] | list[dict] | None = None
+    
+    # dynamic model control
+    model_control: ModelControlParams | None = None
 
     # sampling & length
     temperature: float | None = None
@@ -89,11 +446,13 @@ class RunParams(BaseModel):
     # misc
     user_id: str | None = None
     request_id: str | None = None
+    app_id: str | None = None
     session_id: str | None = None  # Deprecated: use conversation_id instead
     conversation_id: str | None = None
     span_id : str | None = None
     parent_span_id : str | None = None
     source: str | None = None
+    timeout: float | None = None
     extra_params: dict[str, Any] = {}
 
     
@@ -164,7 +523,7 @@ class ModelClient:
         self.cfg = cfg
         self._client = client or httpx.AsyncClient(http2=True, timeout=httpx.Timeout(600))
         self._tracer = trace.get_tracer(__name__)
-        self._logger = logging.getLogger("model_client")
+        self._logger = get_logger("model_client")
         self._is_debug = is_debug
 
         if self._is_debug:
@@ -266,7 +625,7 @@ class ModelClient:
             "model": self.cfg.model,
         }
 
-        self._logger.info(json.dumps(log_data, separators=(",", ":")))
+        self._logger.debug(json.dumps(log_data, separators=(",", ":")))
 
     async def _log_response_jsonl(self, response: httpx.Response) -> None:
         """Log incoming HTTP response in JSONL format for production use."""
@@ -291,9 +650,8 @@ class ModelClient:
         else:
             log_data["body"] = "<streaming response>"
 
-        self._logger.info(json.dumps(log_data, separators=(",", ":")))
+        self._logger.debug(json.dumps(log_data, separators=(",", ":")))
 
-    @retry(wait=wait_exponential_jitter(), stop=stop_after_attempt(3))
     async def arun(self, params: RunParams) -> AsyncGenerator[Union[ModelResponse, StreamingModelResponse], None]:
         """Execute the LLM call with dynamic ``params``.
         
@@ -314,18 +672,25 @@ class ModelClient:
 
         # 初始化或更新遥测上下文，包含通用请求数据
         if "llm_request_body" not in params.trace_context:
-            params.trace_context["llm_request_body"] = {
+            request_body = {
                 "model": self.cfg.model,
                 "provider": self.cfg.provider,
                 "messages": [msg.model_dump() for msg in params.messages],
+                "stream": params.stream,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
+            # 添加tool_params信息
+            if params.tool_params is not None:
+                request_body["tool_params"] = params.tool_params.model_dump() if hasattr(params.tool_params, 'model_dump') else params.tool_params
+            params.trace_context["llm_request_body"] = request_body
         # 初始化响应体容器
         params.trace_context["llm_response_body"] = {}
         params.trace_context["responses"] = []
 
         if params.request_id:
             attrs["http.request_id"] = params.request_id
+        if params.app_id:
+            attrs["http.app_id"] = params.app_id
         if params.session_id:
             attrs["user.session_id"] = params.session_id
         if params.conversation_id:
@@ -335,6 +700,7 @@ class ModelClient:
 
         for key, val in (
             ("request_id", params.request_id),
+            ("app_id", params.app_id),
             ("session_id", params.session_id),  # Keep for backward compatibility
             ("conversation_id", params.conversation_id),  # New field
             ("user_id", params.user_id),
@@ -424,7 +790,7 @@ class SyncModelClient:
         self.cfg = cfg
         self._client = client or httpx.Client(http2=True, timeout=httpx.Timeout(600))
         self._tracer = trace.get_tracer(__name__)
-        self._logger = logging.getLogger("model_client")
+        self._logger = get_logger("model_client")
         self._is_debug = is_debug
 
         if self._is_debug:
@@ -494,7 +860,7 @@ class SyncModelClient:
             "model": self.cfg.model,
         }
 
-        self._logger.info(json.dumps(log_data, separators=(",", ":")))
+        self._logger.debug(json.dumps(log_data, separators=(",", ":"), ensure_ascii=False))
 
     def _log_response_jsonl(self, response: httpx.Response) -> None:
         """Log incoming HTTP response in JSONL format for production use."""
@@ -518,7 +884,7 @@ class SyncModelClient:
         else:
             log_data["body"] = "<streaming response>"
 
-        self._logger.info(json.dumps(log_data, separators=(",", ":")))
+        self._logger.debug(json.dumps(log_data, separators=(",", ":"), ensure_ascii=False))
 
     def _sanitize_headers(self, headers: dict[str, str]) -> dict[str, str]:
         """Remove sensitive information from headers."""
@@ -546,7 +912,6 @@ class SyncModelClient:
         except (json.JSONDecodeError, UnicodeDecodeError):
             return body[:1000] + "..." if len(body) > 1000 else body
 
-    @retry(wait=wait_exponential_jitter(), stop=stop_after_attempt(3))
     def run(self, params: RunParams) -> Generator[Union[ModelResponse, StreamingModelResponse], None, None]:
         """Execute the LLM call with dynamic ``params``.
         
@@ -565,18 +930,13 @@ class SyncModelClient:
             "model": self.cfg.model,
         }
 
-        if "llm_request_body" not in params.trace_context:
-            params.trace_context["llm_request_body"] = {
-                "model": self.cfg.model,
-                "provider": self.cfg.provider,
-                "messages": [msg.model_dump() for msg in params.messages],
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
         params.trace_context["llm_response_body"] = {}
         params.trace_context["responses"] = []
 
         if params.request_id:
             attrs["http.request_id"] = params.request_id
+        if params.app_id:
+            attrs["http.app_id"] = params.app_id
         if params.session_id:
             attrs["user.session_id"] = params.session_id
         if params.conversation_id:
@@ -586,6 +946,7 @@ class SyncModelClient:
 
         for key, val in (
             ("request_id", params.request_id),
+            ("app_id", params.app_id),
             ("session_id", params.session_id),  # Keep for backward compatibility
             ("conversation_id", params.conversation_id),  # New field
             ("user_id", params.user_id),

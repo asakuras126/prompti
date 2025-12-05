@@ -1,0 +1,27 @@
+name: task_manager
+description: Manage tasks
+version: "1.0"
+aliases: ["prod"]
+variants:
+  default:
+    selector: []
+    required_variables: ["tasks", "priority_threshold"]
+    model_config:
+      provider: litellm
+      model: gpt-3.5-turbo
+    messages:
+      - role: user
+        content:
+          - type: text
+            text: |
+              Task Report:
+              {% for task in tasks -%}
+              {% if task.priority >= priority_threshold -%}
+              🔥 HIGH: {{ task.name }} (Priority: {{ task.priority }})
+              {% else -%}
+              📝 NORMAL: {{ task.name }} (Priority: {{ task.priority }})
+              {% endif -%}
+              {% endfor -%}
+
+              {% set high_priority_count = tasks | selectattr('priority', '>=', priority_threshold) | list | length -%}
+              Total high-priority tasks: {{ high_priority_count }}
