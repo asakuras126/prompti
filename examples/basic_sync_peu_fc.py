@@ -29,20 +29,10 @@ setting = Setting(
     registry_api_key="7e5d106c-e701-4587-a95a-b7c7c02ee619",
 )
 
-# setting = Setting(
-#     registry_url="http://localhost:8080/api/v1",
-#     registry_api_key="ccffa346-2e96-4596-b0a3-a63dee6be837",
-# )
+
 engine = PromptEngine.from_setting(setting)
 
 
-# response = completion(
-#     # model="bedrock/converse/us.anthropic.claude-3-7-sonnet-20250219-v1:0",  # converse 接口
-#     model="bedrock/converse/us.anthropic.claude-sonnet-4-20250514-v1:0",
-#     messages=[{"role": "user", "content": "Hello"}],
-#     api_base="https://nlb-test.miaoda.io",               # 指定 base_url
-#     api_key="ABSKbWQtcmRtKzEtYXQtMTk0NjI1NzQwNjM1OnhsVTBML0VtSEZCbTJjVG1wSXpGQWlHdExvWk93WmRWeFFlZzVET3QzZVZpZURkai9NdXd6cm9vVno0PQ=="                        # 或者配置在环境变量里
-# )
 
 model_cfg = ModelConfig(
     provider="pseudo_function_calling",
